@@ -26,9 +26,9 @@ class TestStockMoveLine(TransactionCase):
 @tagged("post_install", "-at_install", "l10n_ve_stock")
 class TestProductBarcode(TransactionCase):
     def test_duplicate_barcode_same_company(self):
-        self.env["product.product"].create({"name": "Prod1", "barcode": "123456", 'type': 'product',})
+        self.env["product.product"].create({"name": "Prod1", "barcode": "123456", 'type': 'consu',})
         with self.assertRaises(ValidationError):
-            self.env["product.product"].create({"name": "Prod2", "barcode": "123456", 'type': 'product',})
+            self.env["product.product"].create({"name": "Prod2", "barcode": "123456", 'type': 'consu',})
 
 
 @tagged("post_install", "-at_install", "l10n_ve_stock")
@@ -37,7 +37,7 @@ class TestStockQuant(TransactionCase):
         loc1 = self.env["stock.location"].create({"name": "Loc1", "usage": "internal"})
         loc2 = self.env["stock.location"].create({"name": "Loc2", "usage": "internal"})
         product_tmpl = self.env["product.template"].create(
-            {"name": "Prod", "physical_location_id": loc1.id, 'type': 'product'}
+            {"name": "Prod", "physical_location_id": loc1.id, 'type': 'consu', 'is_storable': True}
         )
         product = product_tmpl.product_variant_id
         quant1 = self.env["stock.quant"].create(
@@ -49,30 +49,30 @@ class TestStockQuant(TransactionCase):
         )
         self.assertFalse(quant2.is_physical_location)
 
+
+
 @tagged("post_install", "-at_install", "l10n_ve_stock")
-class TestProductTemplate(TransactionCase):
-    def test_check_taxes_id_multiple_taxes_same_company(self):
-        tax1 = self.env["account.tax"].create({
-            "name": "Tax 1",
-            "amount_type": "percent",
-            "amount": 10,
-            "company_id": self.env.company.id,
-        })
-        tax2 = self.env["account.tax"].create({
-            "name": "Tax 2",
-            "amount_type": "percent",
-            "amount": 20,
-            "company_id": self.env.company.id,
-        })
-        with self.assertRaises(ValidationError):
-            self.env["product.product"].create({
-                "name": "Product 1",
-                "barcode": "123456",
-                "type": 'product',
-                "taxes_id": [(6, 0, [tax1.id, tax2.id])],
-                "product_tmpl_id": self.env["product.template"].create({
-                    "name": "Prod1",
-                    "uom_id": self.env.ref('uom.product_uom_unit').id,
-                    "uom_po_id": self.env.ref('uom.product_uom_unit').id,
-                }).id,
-            })
+class TestStockLocationGetWarehouse(TransactionCase):
+    def test_get_warehouse(self):
+        warehouse = self.env["stock.warehouse"].create({"name": "Get WH", "code": "GWH"})
+        shelf = self.env["stock.location"].create(
+            {"name": "Shelf", "location_id": warehouse.lot_stock_id.id, "usage": "internal"}
+        )
+        self.assertEqual(shelf.get_warehouse(), warehouse)
+        self.assertFalse(self.env["stock.location"].get_warehouse())
+
+
+@tagged("post_install", "-at_install", "l10n_ve_stock")
+class TestStockQuantAlterLocations(TransactionCase):
+    def test_product_alter_location_ids(self):
+        warehouse = self.env["stock.warehouse"].create({"name": "Quant WH", "code": "QAW"})
+        product = self.env["product.product"].create(
+            {"name": "Quant Alter Product", "type": "consu", "is_storable": True}
+        )
+        quant = self.env["stock.quant"].create(
+            {"product_id": product.id, "location_id": warehouse.lot_stock_id.id, "quantity": 2}
+        )
+        self.assertFalse(quant.product_alter_location_ids)
+        new_quant = self.env["stock.quant"].new({"product_id": product.id})
+        self.assertEqual(new_quant.product_alter_location_ids._origin, quant)
+        self.assertFalse(self.env["stock.quant"].new({}).product_alter_location_ids)

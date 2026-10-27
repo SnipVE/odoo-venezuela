@@ -1,7 +1,9 @@
 
 import logging
+from datetime import timedelta
 from odoo.tests import TransactionCase, tagged
 from odoo import fields, Command
+from odoo.exceptions import UserError
 
 _logger = logging.getLogger(__name__)
 
@@ -104,6 +106,33 @@ class TestForeignBalance(TransactionCase):
             "type_tax_use": "sale",
             "company_id": self.company.id,
             "tax_group_id": self.test_tax_group.id,
+        })
+
+        self.account_bank = self.env['account.account'].search([('code', '=', '100100'), ('company_ids', 'in', self.company.id)], limit=1)
+        if not self.account_bank:
+            self.account_bank = self.env['account.account'].create({
+                'name': 'Bank Account',
+                'code': '100100',
+                'account_type': 'asset_cash',
+                'company_ids': [(6, 0, [self.company.id])],
+                'reconcile': True,
+            })
+
+        self.manual_in = self.env.ref("account.account_payment_method_manual_in")
+        self.manual_out = self.env.ref("account.account_payment_method_manual_out")
+
+        self.pm_line_in = self.env["account.payment.method.line"].create({
+            "name": "Manual Inbound",
+            "payment_method_id": self.manual_in.id,
+            "payment_type": "inbound",
+            "payment_account_id": self.account_bank.id,
+        })
+
+        self.pm_line_out = self.env["account.payment.method.line"].create({
+            "name": "Manual Outbound",
+            "payment_method_id": self.manual_out.id,
+            "payment_type": "outbound",
+            "payment_account_id": self.account_bank.id,
         })
 
         self.sale_journal = self.env["account.journal"].search(
@@ -362,6 +391,9 @@ class TestForeignBalance(TransactionCase):
                 'code': 'BNKUSD',
                 'currency_id': self.currency_usd.id,
                 'company_id': self.company.id,
+                'default_account_id': self.account_bank.id,
+                'inbound_payment_method_line_ids': [(6, 0, self.pm_line_in.ids)],
+                'outbound_payment_method_line_ids': [(6, 0, self.pm_line_out.ids)],
             })
 
         # Create invoice in USD
@@ -461,6 +493,9 @@ class TestForeignBalance(TransactionCase):
                 'code': 'BNKVEF',
                 'currency_id': self.currency_vef.id,
                 'company_id': self.company.id,
+                'default_account_id': self.account_bank.id,
+                'inbound_payment_method_line_ids': [(6, 0, self.pm_line_in.ids)],
+                'outbound_payment_method_line_ids': [(6, 0, self.pm_line_out.ids)],
             })
 
         # Create invoice in USD
@@ -564,6 +599,9 @@ class TestForeignBalance(TransactionCase):
                 'code': 'BNKEUR',
                 'currency_id': self.currency_eur.id,
                 'company_id': self.company.id,
+                'default_account_id': self.account_bank.id,
+                'inbound_payment_method_line_ids': [(6, 0, self.pm_line_in.ids)],
+                'outbound_payment_method_line_ids': [(6, 0, self.pm_line_out.ids)],
             })
 
         # Create invoice in USD
@@ -804,7 +842,7 @@ class TestForeignBalance(TransactionCase):
                             "quantity": 1.0,
                             "price_unit": 56200.0,
                             "account_id": self.account_income.id,
-                            "tax_ids": [(5, 0, 0)],
+                            "tax_ids": [(6, 0, [self.test_tax.id])],
                         }
                     ),
                 ],
@@ -813,10 +851,9 @@ class TestForeignBalance(TransactionCase):
         invoice.with_context(move_action_post_alert=True).action_post()
         self.assertEqual(invoice.state, "posted", "La factura no se publicó")
 
-        # Total VEF: 23.200 + 56.200 + 3.712 (IVA) = 83.112,00
         self.assertAlmostEqual(
-            invoice.amount_total, 83112.0, places=2,
-            msg="Total factura VEF debe ser 83.112,00",
+            invoice.amount_total, 92104.0, places=2,
+            msg="Total factura VEF debe ser 92104.0",
         )
 
         # Cuadre exacto (este assert detecta el bug de $0,01)
@@ -824,8 +861,7 @@ class TestForeignBalance(TransactionCase):
             invoice.line_ids, "invoice_two_products_rate_402"
         )
 
-        # Total USD esperado: 83.112 / 402,3343 ≈ 206,57
-        expected_usd = 83112.0 / RATE
+        expected_usd = 228.92
         self.assertAlmostEqual(
             fd, expected_usd, delta=0.02,
             msg=f"Total USD debe ser ≈ {expected_usd:.2f}",
@@ -835,6 +871,121 @@ class TestForeignBalance(TransactionCase):
         self._assert_non_payment_term_lines_convert(
             invoice.line_ids, invoice.date, "invoice_two_products_per_line"
         )
+
+    def _assert_foreign_balance_matches_debit_credit(self, lines, label):
+        """`foreign_balance` (stored) must always equal foreign_debit -
+        foreign_credit on every line, e.g. the receivable line after the
+        payment term residual distribution rewrote its debit/credit."""
+        for line in lines:
+            self.assertAlmostEqual(
+                line.foreign_balance, line.foreign_debit - line.foreign_credit, places=2,
+                msg=(
+                    f"{label}: foreign_balance desfasado en {line.display_type} '{line.name}' "
+                    f"(debit={line.foreign_debit}, credit={line.foreign_credit}, "
+                    f"balance={line.foreign_balance})"
+                ),
+            )
+
+    def test_invoice_foreign_balance_matches_debit_credit_after_pt_residual(self):
+        """La distribución del residuo en la CxC reescribe foreign_debit; el
+        saldo alterno (foreign_balance) debe quedar coherente con él."""
+        self._set_usd_rate(402.3343)
+        invoice = self.env["account.move"].create({
+            "move_type": "out_invoice",
+            "partner_id": self.partner.id,
+            "journal_id": self.sale_journal.id,
+            "currency_id": self.currency_vef.id,
+            "date": fields.Date.today(),
+            "invoice_line_ids": [
+                Command.create({
+                    "product_id": self.product.id, "quantity": 1.0, "price_unit": 23200.0,
+                    "account_id": self.account_income.id, "tax_ids": [(6, 0, [self.test_tax.id])],
+                }),
+                Command.create({
+                    "product_id": self.product.id, "quantity": 1.0, "price_unit": 56200.0,
+                    "account_id": self.account_income.id, "tax_ids": [(6, 0, [self.test_tax.id])],
+                }),
+            ],
+        })
+        self._assert_foreign_balance_matches_debit_credit(invoice.line_ids, "draft")
+        invoice.with_context(move_action_post_alert=True).action_post()
+        invoice.invalidate_recordset()
+        invoice.line_ids.invalidate_recordset()
+        self._assert_foreign_balance_matches_debit_credit(invoice.line_ids, "posted")
+
+    def test_usd_invoice_rate_803_34_foreign_balance_matches_debit_credit(self):
+        """Escenario del ticket (factura en USD, tasa 803,34, dos líneas de
+        12,9456 con IVA 16% incluido): el saldo alterno de cada línea debe
+        coincidir con su débito/crédito alterno. Regresión: con el código
+        actual este escenario ya cuadra; el desfase se reproduce en
+        `test_invoice_foreign_balance_matches_debit_credit_after_pt_residual`."""
+        self._set_usd_rate(803.34)
+        tax_included = self.env["account.tax"].create({
+            "name": "IVA 16% incluido", "amount": 16, "amount_type": "percent",
+            "type_tax_use": "sale", "company_id": self.company.id,
+            "tax_group_id": self.test_tax_group.id, "price_include_override": "tax_included",
+        })
+        invoice = self.env["account.move"].create({
+            "move_type": "out_invoice",
+            "partner_id": self.partner.id,
+            "journal_id": self.sale_journal.id,
+            "currency_id": self.currency_usd.id,
+            "invoice_date": fields.Date.today(),
+            "date": fields.Date.today(),
+            "invoice_line_ids": [
+                Command.create({
+                    "product_id": self.product.id, "quantity": 1.0, "price_unit": 12.9456,
+                    "account_id": self.account_income.id, "tax_ids": [(6, 0, tax_included.ids)],
+                })
+                for _i in range(2)
+            ],
+        })
+        self._assert_foreign_balance_matches_debit_credit(invoice.line_ids, "draft")
+        invoice.with_context(move_action_post_alert=True).action_post()
+        invoice.invalidate_recordset()
+        invoice.line_ids.invalidate_recordset()
+        self._assert_foreign_balance_matches_debit_credit(invoice.line_ids, "posted")
+        self._assert_foreign_balance_squares(invoice.line_ids, "usd_invoice_803_34")
+
+    def test_payment_register_wizard_rejects_zero_amount(self):
+        invoice = self.env["account.move"].create({
+            "move_type": "out_invoice",
+            "partner_id": self.partner.id,
+            "journal_id": self.sale_journal.id,
+            "currency_id": self.currency_usd.id,
+            "date": fields.Date.today(),
+            "invoice_line_ids": [Command.create({
+                "product_id": self.product.id, "quantity": 1.0, "price_unit": 100.0,
+                "account_id": self.account_income.id,
+            })],
+        })
+        invoice.with_context(move_action_post_alert=True).action_post()
+        wizard = self.env["account.payment.register"].with_context(
+            active_model="account.move", active_ids=invoice.ids,
+        ).create({"amount": 0.0})
+        with self.assertRaises(UserError):
+            wizard.action_create_payments()
+        self.assertFalse(invoice.payment_ids)
+
+    def test_payment_register_wizard_accepts_non_zero_amount(self):
+        invoice = self.env["account.move"].create({
+            "move_type": "out_invoice",
+            "partner_id": self.partner.id,
+            "journal_id": self.sale_journal.id,
+            "currency_id": self.currency_usd.id,
+            "date": fields.Date.today(),
+            "invoice_line_ids": [Command.create({
+                "product_id": self.product.id, "quantity": 1.0, "price_unit": 100.0,
+                "account_id": self.account_income.id,
+            })],
+        })
+        invoice.with_context(move_action_post_alert=True).action_post()
+        wizard = self.env["account.payment.register"].with_context(
+            active_model="account.move", active_ids=invoice.ids,
+        ).create({"amount": 10.0})
+        wizard.action_create_payments()
+        invoice.invalidate_recordset()
+        self.assertIn(invoice.payment_state, ("partial", "in_payment", "paid"))
 
     def test_vendor_invoice_foreign_balance(self):
         """ Prueba el cuadre de foreign_balance en factura de proveedor (in_invoice) """
@@ -938,7 +1089,7 @@ class TestForeignBalance(TransactionCase):
                             "quantity": 1.0,
                             "price_unit": 56200.0, 
                             "account_id": self.account_income.id,
-                            "tax_ids": [(5, 0, 0)],
+                            "tax_ids": [(6, 0, [self.test_tax.id])],
                         }
                     ),
                 ],
@@ -953,5 +1104,204 @@ class TestForeignBalance(TransactionCase):
 
         fd, fc = self._assert_foreign_balance_squares(
             invoice.line_ids, "invoice_multipart_term"
+        )
+
+    def test_invoice_tax_line_foreign_recompute_on_date_change(self):
+        """Regresion: cambiar `invoice_date` (y por tanto la tasa alterna)
+        debe recalcular el debito/credito alterno de la linea de impuesto.
+
+        Causa raiz del bug: `_get_foreign_value` devolvia `self.foreign_balance`
+        para lineas 'tax', pero `foreign_balance` se calcula como
+        `foreign_debit - foreign_credit` -- los mismos campos que se estan
+        recalculando --, asi que la linea de impuesto quedaba congelada en
+        el valor con el que se creo la factura, sin importar que
+        `invoice_date`/la tasa cambiaran despues.
+        """
+        day1 = fields.Date.today()
+        day2 = day1 - timedelta(days=1)
+        rate_day2 = 120.0  # distinto al rate_day1 (40.0) seteado en setUp
+
+        self.env["res.currency.rate"].create(
+            {
+                "name": day2,
+                "currency_id": self.currency_usd.id,
+                "inverse_company_rate": rate_day2,
+                "company_id": self.company.id,
+            }
+        )
+
+        purchase_journal = self.env["account.journal"].search(
+            [("type", "=", "purchase"), ("company_id", "=", self.company.id)], limit=1
+        ) or self.env["account.journal"].sudo().create(
+            {
+                "name": "Purchase Test Recompute",
+                "code": "PRTRC",
+                "type": "purchase",
+                "company_id": self.company.id,
+            }
+        )
+
+        purchase_tax = self.env["account.tax"].create({
+            "name": "IVA 16% Compras Recompute",
+            "amount": 16,
+            "amount_type": "percent",
+            "type_tax_use": "purchase",
+            "company_id": self.company.id,
+            "tax_group_id": self.test_tax_group.id,
+        })
+
+        invoice = self.env["account.move"].create(
+            {
+                "move_type": "in_invoice",
+                "partner_id": self.partner.id,
+                "journal_id": purchase_journal.id,
+                "currency_id": self.currency_vef.id,  # Factura en VEF (moneda de la compañía)
+                "date": day1,
+                "invoice_date": day1,
+                "invoice_date_display": day1,
+                "invoice_line_ids": [
+                    Command.create(
+                        {
+                            "product_id": self.product.id,
+                            "quantity": 1.0,
+                            "price_unit": 1000.0,
+                            "account_id": self.account_income.id,
+                            "tax_ids": [(6, 0, [purchase_tax.id])],
+                        }
+                    )
+                ],
+            }
+        )
+        self.assertEqual(invoice.state, "draft")
+
+        tax_line = invoice.line_ids.filtered(lambda l: l.display_type == "tax")
+        self.assertTrue(tax_line, "La factura debe tener una linea de impuesto")
+
+        expected_day1 = self.currency_vef._convert(
+            tax_line.debit - tax_line.credit,
+            self.currency_usd,
+            self.company,
+            day1,
+        )
+        self.assertAlmostEqual(
+            tax_line.foreign_debit - tax_line.foreign_credit,
+            expected_day1,
+            delta=0.02,
+            msg="Foreign debit/credit de la linea de impuesto no coincide con la tasa inicial",
+        )
+
+        invoice.write(
+            {"invoice_date": day2, "invoice_date_display": day2, "date": day2}
+        )
+
+        tax_line = invoice.line_ids.filtered(lambda l: l.display_type == "tax")
+        expected_day2 = self.currency_vef._convert(
+            tax_line.debit - tax_line.credit,
+            self.currency_usd,
+            self.company,
+            day2,
+        )
+
+        self.assertNotAlmostEqual(
+            expected_day1,
+            expected_day2,
+            delta=0.02,
+            msg="El escenario de prueba no cambio realmente la tasa entre day1 y day2",
+        )
+        self.assertAlmostEqual(
+            tax_line.foreign_debit - tax_line.foreign_credit,
+            expected_day2,
+            delta=0.02,
+            msg=(
+                "Bug: la linea de impuesto no se recalculo con la nueva tasa "
+                "al cambiar invoice_date (se quedo con el valor de creacion)"
+            ),
+        )
+
+    def test_invoice_tax_line_foreign_recompute_on_invoice_date_only(self):
+        """Escenario real del ticket: factura de VENTA, escribiendo solo
+        `invoice_date` (sin tocar `date`) -- lo que hace el usuario en la UI.
+
+        `_round_mode` debe disparar la resincronizacion con el cambio de
+        `invoice_date` solamente; no depende de que `date` cambie tambien
+        (a diferencia del test de compra de arriba, que escribe ambas).
+        """
+        day1 = fields.Date.today()
+        day2 = day1 - timedelta(days=1)
+        rate_day2 = 120.0  # distinto al rate_day1 (40.0) seteado en setUp
+
+        self.env["res.currency.rate"].create(
+            {
+                "name": day2,
+                "currency_id": self.currency_usd.id,
+                "inverse_company_rate": rate_day2,
+                "company_id": self.company.id,
+            }
+        )
+
+        sale_journal = self.env["account.journal"].search(
+            [("type", "=", "sale"), ("company_id", "=", self.company.id)], limit=1
+        ) or self.env["account.journal"].sudo().create(
+            {
+                "name": "Sale Test Recompute",
+                "code": "SLTRC",
+                "type": "sale",
+                "company_id": self.company.id,
+            }
+        )
+
+        sale_tax = self.env["account.tax"].create({
+            "name": "IVA 16% Ventas Recompute",
+            "amount": 16,
+            "amount_type": "percent",
+            "type_tax_use": "sale",
+            "company_id": self.company.id,
+            "tax_group_id": self.test_tax_group.id,
+        })
+
+        invoice = self.env["account.move"].create(
+            {
+                "move_type": "out_invoice",
+                "partner_id": self.partner.id,
+                "journal_id": sale_journal.id,
+                "currency_id": self.currency_vef.id,
+                "date": day1,
+                "invoice_date": day1,
+                "invoice_line_ids": [
+                    Command.create(
+                        {
+                            "product_id": self.product.id,
+                            "quantity": 1.0,
+                            "price_unit": 1000.0,
+                            "account_id": self.account_income.id,
+                            "tax_ids": [(6, 0, [sale_tax.id])],
+                        }
+                    )
+                ],
+            }
+        )
+        self.assertEqual(invoice.state, "draft")
+
+        tax_line = invoice.line_ids.filtered(lambda l: l.display_type == "tax")
+        self.assertTrue(tax_line, "La factura debe tener una linea de impuesto")
+
+        # Solo invoice_date -- date se queda en day1 a proposito.
+        invoice.write({"invoice_date": day2})
+
+        tax_line = invoice.line_ids.filtered(lambda l: l.display_type == "tax")
+        expected_day2 = self.currency_vef._convert(
+            tax_line.debit - tax_line.credit,
+            self.currency_usd,
+            self.company,
+            day2,
+        )
+        self.assertAlmostEqual(
+            tax_line.foreign_debit - tax_line.foreign_credit,
+            expected_day2,
+            delta=0.02,
+            msg=(
+                "La linea de impuesto no se recalculo al cambiar solo "
+                "invoice_date (sin tocar date) en una factura de venta"
+            ),
         )
 
